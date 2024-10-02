@@ -7,6 +7,7 @@ import tomosipo as ts
 import tomosipo.vector_calc as vc
 import base64
 import hashlib
+import io
 import collections
 import numpy as np
 from pathlib import Path
@@ -137,7 +138,9 @@ def pg_to_line_items(pg, i):
         src_pos = pg.src_pos[i]
         rays = [line_item(pos=np.stack((src_pos, c)), width=0.2) for c in corners]
         src_curve = line_item(pos=pg.src_pos, width=0.2)
-        return [src_curve, det_curve, det_plane, *rays]
+        # return [src_curve, det_curve, det_plane, *rays]
+        # FIXME: adjust this before commit
+        return [src_curve, det_plane, *rays]
     if pg.is_parallel:
         return [det_curve, det_plane]
 
@@ -317,7 +320,7 @@ def text_svg_animation(line_items, duration=10, height=100, width=100):
 ###############################################################################
 #                Tying it all together: from *geometries => svg               #
 ###############################################################################
-def svg(*geoms, height=200, width=320, duration=3, camera=None, show_axes=True):
+def svg(*geoms, height=200, width=320, duration=3, camera=None, show_axes=True, output='svg'):
     num_steps = max(map(len, geoms))
 
     c = camera or default_camera(height, width)
@@ -351,11 +354,113 @@ def svg(*geoms, height=200, width=320, duration=3, camera=None, show_axes=True):
         # Return axes and flattened list of geometries
         return [*axes_list, *(f for fs in frames_list for f in fs)]
 
-    svg_text = text_svg_animation(
-        [geoms2frame(i) for i in range(num_steps)],
-        duration=duration,
-        height=height,
-        width=width,
+
+    if output == 'svg':
+        svg_text = text_svg_animation(
+            [geoms2frame(i) for i in range(num_steps)],
+            duration=duration,
+            height=height,
+            width=width,
+        )
+        return SVG(svg_text, height=height, width=width)
+    else:
+        buff = gif_animation(
+            [geoms2frame(i) for i in range(num_steps)],
+            duration=duration,
+            height=height,
+            width=width,
+            format=output
+        )
+        return GIF(buff, height=height, width=width)
+
+
+
+###############################################################################
+#                          From LineItems to GIF frame                        #
+###############################################################################
+
+def gif_frame(
+    line_items, frame_begin, total_duration, height=100, width=100
+):
+    from PIL import Image, ImageDraw
+
+    # GIF with white background
+    im = Image.new('RGB', (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(im)
+    for l in line_items:
+        # extract y and x coordinates (from zyx to xy)
+        pos2d = l.pos[:, (2, 1)]
+        # Correct y to move from bottom to top instead of vice versa
+        pos2d[:, 1] = height - pos2d[:, 1]
+        # draw line segments
+        for a, b in zip(pos2d[:-1], pos2d[1:]):
+            fill = tuple(int(c * 255) for c in l.color[:3])
+            draw.line(
+                ((a[0], a[1]), (b[0], b[1])),
+                width=int(l.width * width / 200),
+                fill=fill
+            )
+
+    # draw progress bar
+    pb_width = frame_begin / total_duration * width
+    pb_height = height // 40
+    draw.line(
+        ((0, height - pb_height // 2), (pb_width, height - pb_height // 2)),
+        width=height // 40,
+        fill=(100, 100, 100)
     )
 
-    return SVG(svg_text, height=height, width=width)
+    return im
+
+
+def gif_animation(line_items, duration=10, height=100, width=100, format='gif'):
+
+    # frame duration in ms
+    frame_duration = lambda line_items: duration / len(line_items)
+
+    # minimum allowable gif frame duration is 20ms
+    if frame_duration(line_items) < 20e-3:
+        line_items = line_items[::math.ceil(20 / len(line_items))]
+
+    const_opts = dict(total_duration=duration, height=height, width=width)
+
+    frames = [
+        gif_frame(ls, i * frame_duration(line_items), **const_opts)
+        for i, ls in enumerate(line_items)
+    ]
+
+    buff = io.BytesIO()
+
+    frames[0].save(
+        buff, save_all=True, append_images=frames[1:], format=format,
+        optimize=False, duration=1000 * frame_duration(line_items), loop=0
+    )
+
+    buff.seek(0)
+    return buff
+
+class GIF:
+    def __init__(self, buff, height=200, width=320):
+        super().__init__()
+        self.buff = buff
+        self.height = height
+        self.width = width
+
+    def _repr_html_(self):
+        tag = r"""<img height="{height}" width="{width}" src="{src}"/>"""
+        return tag.format(
+            height=self.height, width=self.width, src=self._data_url_()
+        )
+
+    def _repr_markdown_(self):
+        return self._repr_html_()
+
+    def _data_url_(self):
+        return 'data:image/gif;base64,{}'.format(
+            base64.b64encode(self.buff.getvalue()).decode()
+        )
+
+    def save(self, path):
+        """Save gif to disk"""
+        path = Path(path)
+        path.write_bytes(self.buff.getbuffer().tobytes())
